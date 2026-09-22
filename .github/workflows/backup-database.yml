@@ -34,7 +34,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client-17 age
           curl -fsSL https://rclone.org/install.sh | sudo bash
-          pg_dump --version && age --version && rclone version | head -1
+          # Le runner a un pg_dump 16 par defaut ; on force la v17 (serveur Supabase en PG17)
+          # en prepandant son dossier au PATH des etapes suivantes.
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+          /usr/lib/postgresql/17/bin/pg_dump --version && age --version && rclone version | head -1
 
       - name: Dump + compression + chiffrement
         env:
