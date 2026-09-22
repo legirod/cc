@@ -1,0 +1,73 @@
+name: Backup fichiers Storage (R2)
+
+# Palier 2 : copie incrementale des fichiers du Storage Supabase vers R2.
+# Le dump SQL (palier 1) ne contient PAS les fichiers uploades (documents, logos,
+# couvertures de notes...), seulement leurs chemins -> on les sauvegarde ici.
+#
+# Miroir prive : pas de chiffrement client (bucket R2 prive + chiffrement au repos
+# assure par Cloudflare). On utilise "copy" (et non "sync") : un fichier supprime
+# dans Supabase N'EST PAS supprime du backup -> protege contre les suppressions.
+
+on:
+  schedule:
+    - cron: "37 2 * * *" # tous les jours a 02:37 UTC (~20 min apres le dump DB)
+  workflow_dispatch: {}
+
+concurrency:
+  group: backup-storage
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Installer rclone
+        run: |
+          set -euo pipefail
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version | head -1
+
+      - name: Configurer rclone (source Supabase Storage + destination R2)
+        env:
+          SUPABASE_S3_ACCESS_KEY_ID: ${{ secrets.SUPABASE_S3_ACCESS_KEY_ID }}
+          SUPABASE_S3_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_S3_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [supabase]
+          type = s3
+          provider = Other
+          access_key_id = ${SUPABASE_S3_ACCESS_KEY_ID}
+          secret_access_key = ${SUPABASE_S3_SECRET_ACCESS_KEY}
+          endpoint = https://igutnslojvelbnqdqsap.storage.supabase.co/storage/v1/s3
+          region = eu-west-1
+          force_path_style = true
+          no_check_bucket = true
+
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${R2_ACCESS_KEY_ID}
+          secret_access_key = ${R2_SECRET_ACCESS_KEY}
+          endpoint = https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
+          acl = private
+          no_check_bucket = true
+          EOF
+
+      - name: Verifier l'acces au Storage Supabase (liste des buckets)
+        run: |
+          echo "Buckets Supabase detectes :"
+          rclone lsd supabase:
+
+      - name: Copie Storage Supabase -> R2 (incremental, sans suppression)
+        run: |
+          set -euo pipefail
+          rclone copy supabase: "r2:${{ secrets.R2_BUCKET }}/storage/" \
+            --fast-list --transfers 8 --checkers 16 --retries 3 --progress
+          echo "=== Contenu sauvegarde dans R2 (storage/) ==="
+          rclone lsd "r2:${{ secrets.R2_BUCKET }}/storage/" || true
