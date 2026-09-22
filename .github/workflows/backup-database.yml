@@ -1,0 +1,101 @@
+name: Backup base de donnees (R2)
+
+# "Couche 2" du backup Linkkit : dump quotidien de la base Postgres de prod,
+# compresse + chiffre, envoye sur Cloudflare R2 (hors Supabase), avec retention.
+#
+# Ce depot est PUBLIC mais ne contient AUCUNE donnee ni secret : juste cette recette.
+# - Les dumps partent directement dans R2 (bucket prive) et sont chiffres (age).
+# - Les identifiants (base, R2, cle publique age) vivent dans les GitHub Secrets,
+#   jamais dans ce fichier. Rien n'est lisible sans la cle privee age (chez toi seul).
+
+on:
+  schedule:
+    - cron: "17 2 * * *" # tous les jours a 02:17 UTC (~04:17 Paris)
+  workflow_dispatch: {} # declenchement manuel (test / backup a la demande)
+
+# Un seul backup a la fois
+concurrency:
+  group: backup-database
+  cancel-in-progress: false
+
+env:
+  RETENTION_DAYS: 30 # on garde les 30 derniers jours, le reste est purge
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Installer les outils (pg_dump 17, age, rclone)
+        run: |
+          set -euo pipefail
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17 age
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          pg_dump --version && age --version && rclone version | head -1
+
+      - name: Dump + compression + chiffrement
+        env:
+          # Connection string du SESSION POOLER (port 5432), avec le mot de passe.
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          # Cle PUBLIQUE age (commence par "age1..."). Sert uniquement a chiffrer.
+          AGE_PUBLIC_KEY: ${{ secrets.BACKUP_AGE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          STAMP="$(date -u +%Y%m%d-%H%M%S)"
+          FILE="linkkit-db-${STAMP}.sql.gz.age"
+
+          # On dumpe les schemas qui contiennent les donnees utilisateurs :
+          #   public  = toutes les tables applicatives (le coeur)
+          #   auth    = les comptes utilisateurs (pour que les logins survivent)
+          #   storage = les metadonnees des fichiers (se couple au palier 2)
+          # --no-owner / --no-privileges = restauration plus simple ailleurs.
+          pg_dump "$SUPABASE_DB_URL" \
+            --no-owner --no-privileges \
+            --schema=public --schema=auth --schema=storage \
+          | gzip -9 \
+          | age -r "$AGE_PUBLIC_KEY" \
+          > "$FILE"
+
+          # Garde-fou : un backup < 1 Ko = dump vide/casse -> on echoue.
+          SIZE="$(stat -c%s "$FILE")"
+          echo "Fichier : $FILE (${SIZE} octets)"
+          if [ "$SIZE" -lt 1024 ]; then
+            echo "::error::Backup suspicieusement petit (${SIZE} octets), abandon."
+            exit 1
+          fi
+          echo "FILE=$FILE" >> "$GITHUB_ENV"
+
+      - name: Configurer rclone pour R2
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${R2_ACCESS_KEY_ID}
+          secret_access_key = ${R2_SECRET_ACCESS_KEY}
+          endpoint = https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
+          acl = private
+          no_check_bucket = true
+          EOF
+
+      - name: Envoi vers R2
+        run: |
+          set -euo pipefail
+          rclone copy "$FILE" "r2:${{ secrets.R2_BUCKET }}/db/" --progress
+          echo "Backups presents sur R2 :"
+          rclone lsl "r2:${{ secrets.R2_BUCKET }}/db/"
+
+      - name: Retention (purge des backups > RETENTION_DAYS jours)
+        run: |
+          set -euo pipefail
+          rclone delete "r2:${{ secrets.R2_BUCKET }}/db/" --min-age "${RETENTION_DAYS}d" --rmdirs || true
+          echo "Retention appliquee (> ${RETENTION_DAYS} jours supprimes)."
