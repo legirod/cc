@@ -1,0 +1,74 @@
+name: Backup archive des SERP (R2, UE)
+
+# Palier 3 : copie de l'archive des SERP de Kolta (bucket R2 kolta-serp-archive,
+# juridiction UE) dans un second bucket R2 en UE (kolta-serp-archive-backup).
+# Depuis le 15/10/2026, la base ne garde plus le contenu des SERP de plus de 48 h :
+# l'archive R2 en est la seule copie hors sauvegardes de la base (30 jours), d'ou ce
+# second exemplaire.
+#
+# Copie faite par R2 lui-meme, d'un bucket a l'autre (copie cote serveur) : les SERP
+# ne transitent pas par GitHub. "copy" et non "sync" : rien n'est jamais supprime de la
+# sauvegarde. --ignore-existing : un fichier deja sauvegarde n'est jamais reecrit (un
+# lot de SERP ne change jamais). Les deux buckets sont verrouilles (bucket lock,
+# retention illimitee sur serp/) : aucun fichier ne peut y etre efface ni reecrit,
+# meme avec une cle valide.
+#
+# Secrets du depot : R2_ACCOUNT_ID (deja present), SERP_R2_BACKUP_ACCESS_KEY_ID et
+# SERP_R2_BACKUP_SECRET_ACCESS_KEY (jeton R2 "Object Read & Write" limite aux deux
+# buckets kolta-serp-archive et kolta-serp-archive-backup).
+
+on:
+  schedule:
+    - cron: "57 2 * * *" # tous les jours a 02:57 UTC, apres la base (02:17) et les fichiers (02:37)
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backup-serp-archive
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Installer rclone
+        run: |
+          set -euo pipefail
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version | head -1
+
+      - name: Configurer rclone (R2, juridiction UE)
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          SERP_R2_BACKUP_ACCESS_KEY_ID: ${{ secrets.SERP_R2_BACKUP_ACCESS_KEY_ID }}
+          SERP_R2_BACKUP_SECRET_ACCESS_KEY: ${{ secrets.SERP_R2_BACKUP_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [r2eu]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${SERP_R2_BACKUP_ACCESS_KEY_ID}
+          secret_access_key = ${SERP_R2_BACKUP_SECRET_ACCESS_KEY}
+          endpoint = https://${R2_ACCOUNT_ID}.eu.r2.cloudflarestorage.com
+          acl = private
+          no_check_bucket = true
+          EOF
+
+      - name: Copie kolta-serp-archive -> kolta-serp-archive-backup (cote serveur, sans suppression ni reecriture)
+        run: |
+          set -euo pipefail
+          rclone copy r2eu:kolta-serp-archive r2eu:kolta-serp-archive-backup \
+            --ignore-existing --fast-list --transfers 16 --checkers 32 --retries 3 \
+            --stats 1m --stats-log-level NOTICE
+
+      - name: Verifier que la sauvegarde contient tous les fichiers de l'archive, a l'identique
+        run: |
+          set -euo pipefail
+          rclone check r2eu:kolta-serp-archive r2eu:kolta-serp-archive-backup --one-way --fast-list
+          echo "Archive    : $(rclone size r2eu:kolta-serp-archive --fast-list --json)"
+          echo "Sauvegarde : $(rclone size r2eu:kolta-serp-archive-backup --fast-list --json)"
