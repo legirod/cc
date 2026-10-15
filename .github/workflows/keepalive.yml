@@ -1,0 +1,39 @@
+name: Maintien des sauvegardes planifiees
+
+# GitHub coupe les taches planifiees d'un depot public sans activite depuis 60 jours :
+# sans commit, les sauvegardes (base, fichiers, archive des SERP) s'arreteraient sans
+# bruit. Chaque lundi, si le dernier commit date de 40 jours ou plus, un commit vide
+# relance le compteur.
+
+on:
+  schedule:
+    - cron: "17 5 * * 1" # chaque lundi a 05:17 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Commit vide si le depot est sans activite depuis 40 jours ou plus
+        run: |
+          set -euo pipefail
+          last=$(git log -1 --format=%ct)
+          days=$(( ( $(date +%s) - last ) / 86400 ))
+          echo "Dernier commit il y a ${days} jours"
+          if [ "$days" -ge 40 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: maintien des sauvegardes planifiees (${days} jours sans activite)"
+            git push
+            echo "Commit vide pousse : compteur des 60 jours relance"
+          fi
