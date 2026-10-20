@@ -1,0 +1,64 @@
+name: Migration des sauvegardes vers le bucket UE (une fois)
+
+# A lancer une seule fois, a la main, apres le passage des secrets sur le bucket
+# R2 en juridiction UE (R2_BUCKET = irva-backups) : recopie les dumps chiffres de
+# la base (db/, 30 derniers jours) de l'ancien bucket (linkkit-backups, region
+# APAC) vers le nouveau. Les fichiers du Storage ne sont pas recopies : le miroir
+# quotidien les reprend directement depuis Supabase.
+# Le jeton R2 (R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY) doit avoir acces aux deux
+# buckets le temps de la migration. Rien n'est supprime de l'ancien bucket.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ancien_bucket:
+        description: "Ancien bucket (region APAC)"
+        required: true
+        default: "linkkit-backups"
+
+jobs:
+  migrer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Installer rclone
+        run: |
+          set -euo pipefail
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version | head -1
+
+      - name: Configurer rclone (ancien bucket + bucket UE)
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<CONF
+          [ancien]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${R2_ACCESS_KEY_ID}
+          secret_access_key = ${R2_SECRET_ACCESS_KEY}
+          endpoint = https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
+          acl = private
+          no_check_bucket = true
+
+          [ue]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${R2_ACCESS_KEY_ID}
+          secret_access_key = ${R2_SECRET_ACCESS_KEY}
+          endpoint = https://${R2_ACCOUNT_ID}.eu.r2.cloudflarestorage.com
+          acl = private
+          no_check_bucket = true
+          CONF
+
+      - name: Recopie des dumps de la base
+        run: |
+          set -euo pipefail
+          rclone copy "ancien:${{ inputs.ancien_bucket }}/db/" "ue:${{ secrets.R2_BUCKET }}/db/" \
+            --max-age 31d --retries 3 --progress
+          echo "Dumps presents dans le bucket UE :"
+          rclone lsl "ue:${{ secrets.R2_BUCKET }}/db/"

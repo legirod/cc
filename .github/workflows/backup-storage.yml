@@ -4,14 +4,20 @@ name: Backup fichiers Storage (R2)
 # Le dump SQL (palier 1) ne contient PAS les fichiers uploades (documents, logos,
 # couvertures de notes...), seulement leurs chemins -> on les sauvegarde ici.
 #
-# Miroir prive : pas de chiffrement client (bucket R2 prive + chiffrement au repos
-# assure par Cloudflare). On utilise "copy" (et non "sync") : un fichier supprime
-# dans Supabase N'EST PAS supprime du backup -> protege contre les suppressions.
+# Miroir prive : pas de chiffrement client (bucket R2 prive, juridiction UE,
+# chiffrement au repos assure par Cloudflare).
+# storage/current/ = copie exacte du Storage. Un fichier supprime ou remplace dans
+# Supabase est deplace dans storage/supprimes/AAAA-MM-JJ/ (protection contre les
+# suppressions), puis efface au bout de RETENTION_DAYS jours : la politique de
+# confidentialite d'Irva promet l'effacement des sauvegardes sous 30 jours.
 
 on:
   schedule:
     - cron: "37 2 * * *" # tous les jours a 02:37 UTC (~20 min apres le dump DB)
   workflow_dispatch: {}
+
+env:
+  RETENTION_DAYS: "30"
 
 concurrency:
   group: backup-storage
@@ -54,7 +60,7 @@ jobs:
           provider = Cloudflare
           access_key_id = ${R2_ACCESS_KEY_ID}
           secret_access_key = ${R2_SECRET_ACCESS_KEY}
-          endpoint = https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
+          endpoint = https://${R2_ACCOUNT_ID}.eu.r2.cloudflarestorage.com
           acl = private
           no_check_bucket = true
           EOF
@@ -64,10 +70,25 @@ jobs:
           echo "Buckets Supabase detectes :"
           rclone lsd supabase:
 
-      - name: Copie Storage Supabase -> R2 (incremental, sans suppression)
+      - name: Miroir Storage Supabase -> R2 (supprimes mis de cote par date)
         run: |
           set -euo pipefail
-          rclone copy supabase: "r2:${{ secrets.R2_BUCKET }}/storage/" \
+          TODAY="$(date -u +%F)"
+          rclone sync supabase: "r2:${{ secrets.R2_BUCKET }}/storage/current/" \
+            --backup-dir "r2:${{ secrets.R2_BUCKET }}/storage/supprimes/${TODAY}/" \
             --fast-list --transfers 8 --checkers 16 --retries 3 --progress
-          echo "=== Contenu sauvegarde dans R2 (storage/) ==="
-          rclone lsd "r2:${{ secrets.R2_BUCKET }}/storage/" || true
+          echo "=== Contenu sauvegarde dans R2 (storage/current/) ==="
+          rclone lsd "r2:${{ secrets.R2_BUCKET }}/storage/current/" || true
+
+      - name: Retention (fichiers supprimes depuis plus de RETENTION_DAYS jours)
+        run: |
+          set -euo pipefail
+          LIMIT="$(date -u -d "-${RETENTION_DAYS} days" +%F)"
+          for DIR in $(rclone lsf --dirs-only "r2:${{ secrets.R2_BUCKET }}/storage/supprimes/" 2>/dev/null || true); do
+            DAY="${DIR%/}"
+            if [[ "$DAY" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ && "$DAY" < "$LIMIT" ]]; then
+              echo "Purge storage/supprimes/${DAY}"
+              rclone purge "r2:${{ secrets.R2_BUCKET }}/storage/supprimes/${DAY}/"
+            fi
+          done
+          echo "Retention appliquee (avant le ${LIMIT})."
