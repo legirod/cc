@@ -1,0 +1,98 @@
+name: Preprod - copie de la structure de la base
+
+# Copie la STRUCTURE de la base de prod Irva (schemas public, etudes, supabase_migrations)
+# vers la base de preprod, plus la liste des migrations deja appliquees.
+# AUCUNE donnee des comptes n'est copiee (seul supabase_migrations.schema_migrations l'est).
+#
+# Lancement manuel uniquement. La preprod doit etre vide (premier passage).
+# Rien n'est ecrit sur la prod : pg_dump ne fait que lire.
+# Ce depot est public : on n'affiche ni le SQL ni les identifiants, seulement les messages d'erreur.
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: preprod-structure
+  cancel-in-progress: false
+
+env:
+  PROD_REF: igutnslojvelbnqdqsap
+  PREPROD_REF: ridxwoantxzqaprcsdtw
+
+jobs:
+  copie:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Garde-fous sur les cibles
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          PREPROD_DB_URL: ${{ secrets.PREPROD_DB_URL }}
+        run: |
+          set -euo pipefail
+          case "$SUPABASE_DB_URL" in *"$PROD_REF"*) ;; *) echo "::error::SUPABASE_DB_URL ne vise pas la prod attendue"; exit 1 ;; esac
+          case "$PREPROD_DB_URL" in *"$PREPROD_REF"*) ;; *) echo "::error::PREPROD_DB_URL ne vise pas la preprod"; exit 1 ;; esac
+          case "$PREPROD_DB_URL" in *"$PROD_REF"*) echo "::error::PREPROD_DB_URL contient la reference de la PROD, abandon"; exit 1 ;; esac
+          echo "Source : prod ($PROD_REF), lecture seule. Cible : preprod ($PREPROD_REF)."
+
+      - name: Installer le client PostgreSQL 17
+        run: |
+          set -euo pipefail
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+
+      - name: Verifier que la preprod est vide
+        env:
+          PREPROD_DB_URL: ${{ secrets.PREPROD_DB_URL }}
+        run: |
+          set -euo pipefail
+          n="$(psql "$PREPROD_DB_URL" -X -A -t -c "select count(*) from pg_tables where schemaname in ('public','etudes')")"
+          echo "Tables deja presentes en preprod : $n"
+          if [ "$n" != "0" ]; then echo "::error::La preprod n'est pas vide, abandon (rien n'a ete modifie)."; exit 1; fi
+
+      - name: Lire la structure de la prod
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          pg_dump "$SUPABASE_DB_URL" --schema-only --no-owner \
+            --schema=public --schema=etudes --schema=supabase_migrations > structure.sql
+          pg_dump "$SUPABASE_DB_URL" --data-only --no-owner \
+            --table=supabase_migrations.schema_migrations > migrations.sql
+          echo "structure.sql : $(wc -l < structure.sql) lignes ; migrations.sql : $(wc -l < migrations.sql) lignes"
+
+      - name: Ecrire la structure dans la preprod
+        env:
+          PREPROD_DB_URL: ${{ secrets.PREPROD_DB_URL }}
+        run: |
+          set -uo pipefail
+          psql "$PREPROD_DB_URL" -X -q -v ON_ERROR_STOP=0 -f structure.sql > /dev/null 2> erreurs-structure.txt
+          psql "$PREPROD_DB_URL" -X -q -v ON_ERROR_STOP=0 -f migrations.sql > /dev/null 2> erreurs-migrations.txt
+          for f in erreurs-structure.txt erreurs-migrations.txt; do
+            echo "== $f : $(grep -c 'ERROR:' "$f" || true) erreur(s)"
+            grep -o 'ERROR:.*' "$f" | cut -c1-200 | sort | uniq -c | sort -rn | head -60 || true
+          done
+
+      - name: Comparer prod et preprod
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          PREPROD_DB_URL: ${{ secrets.PREPROD_DB_URL }}
+        run: |
+          set -euo pipefail
+          q="select 'tables', count(*) from pg_tables where schemaname in ('public','etudes')
+             union all select 'vues', count(*) from pg_views where schemaname in ('public','etudes')
+             union all select 'fonctions', count(*) from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname in ('public','etudes')
+             union all select 'regles_rls', count(*) from pg_policies where schemaname in ('public','etudes')
+             union all select 'declencheurs', count(*) from pg_trigger t join pg_class c on c.oid=t.tgrelid join pg_namespace n on n.oid=c.relnamespace where n.nspname in ('public','etudes') and not t.tgisinternal
+             union all select 'index', count(*) from pg_indexes where schemaname in ('public','etudes')
+             union all select 'migrations', count(*) from supabase_migrations.schema_migrations"
+          psql "$SUPABASE_DB_URL" -X -A -t -F ' ' -c "$q" > prod.txt
+          psql "$PREPROD_DB_URL" -X -A -t -F ' ' -c "$q" > preprod.txt
+          echo "objet prod preprod"
+          join <(sort prod.txt) <(sort preprod.txt) | tee comparaison.txt
+          if awk '$2 != $3 { bad=1 } END { exit bad ? 0 : 1 }' comparaison.txt; then
+            echo "::warning::Ecart entre prod et preprod (voir ci-dessus)."
+          fi
