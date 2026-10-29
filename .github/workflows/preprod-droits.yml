@@ -1,0 +1,137 @@
+name: Preprod - alignement des droits sur la prod
+
+# Recopie sur la preprod les droits exacts de la prod pour anon, authenticated et PUBLIC
+# (tables, sequences, colonnes, fonctions des schemas public et etudes), puis verifie
+# que les deux listes de droits sont identiques. Rejouable a volonte.
+# Rien n'est ecrit sur la prod. Ce depot est public : on n'affiche que des comptages.
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: preprod-droits
+  cancel-in-progress: false
+
+env:
+  PROD_REF: igutnslojvelbnqdqsap
+  PREPROD_REF: ridxwoantxzqaprcsdtw
+
+jobs:
+  droits:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Installer le client PostgreSQL 17
+        run: |
+          set -euo pipefail
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+
+      # Meme logique que preprod-structure.yml : adresse complete ou mot de passe seul.
+      - name: Preparer l'adresse de la preprod
+        env:
+          PREPROD_SECRET: ${{ secrets.PREPROD_DB_URL }}
+        run: |
+          set -euo pipefail
+          case "$PREPROD_SECRET" in
+            postgres://*|postgresql://*) url="$PREPROD_SECRET" ;;
+            *)
+              url=""
+              for h in aws-0-eu-west-1 aws-1-eu-west-1; do
+                c="postgresql://postgres.${PREPROD_REF}:${PREPROD_SECRET}@${h}.pooler.supabase.com:5432/postgres"
+                if psql "$c" -X -A -t -c "select 1" > /dev/null 2>&1; then url="$c"; break; fi
+              done
+              if [ -z "$url" ]; then echo "::error::Connexion a la preprod impossible avec ce mot de passe"; exit 1; fi
+              ;;
+          esac
+          echo "::add-mask::$url"
+          echo "PREPROD_DB_URL=$url" >> "$GITHUB_ENV"
+
+      - name: Garde-fous sur les cibles
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          case "$SUPABASE_DB_URL" in *"$PROD_REF"*) ;; *) echo "::error::SUPABASE_DB_URL ne vise pas la prod attendue"; exit 1 ;; esac
+          case "$PREPROD_DB_URL" in *"$PREPROD_REF"*) ;; *) echo "::error::PREPROD_DB_URL ne vise pas la preprod"; exit 1 ;; esac
+          case "$PREPROD_DB_URL" in *"$PROD_REF"*) echo "::error::PREPROD_DB_URL contient la reference de la PROD, abandon"; exit 1 ;; esac
+
+      - name: Ecrire la requete qui liste les droits
+        run: |
+          cat > droits.sql <<'SQL'
+          with roles as (
+            select 0::oid as oid, 'public' as nm
+            union all select oid, rolname from pg_roles where rolname in ('anon', 'authenticated')
+          ),
+          rel as (
+            select n.nspname, c.relname, c.relkind, r.nm,
+                   string_agg(a.privilege_type, ', ' order by a.privilege_type) as privs
+            from pg_class c
+            join pg_namespace n on n.oid = c.relnamespace
+            cross join lateral aclexplode(coalesce(c.relacl,
+              acldefault(case when c.relkind = 'S' then 's'::"char" else 'r'::"char" end, c.relowner))) a
+            join roles r on r.oid = a.grantee
+            where n.nspname in ('public', 'etudes') and c.relkind in ('r', 'v', 'm', 'S', 'p', 'f')
+            group by 1, 2, 3, 4
+          ),
+          col as (
+            select n.nspname, c.relname, t.attname, r.nm, a.privilege_type
+            from pg_attribute t
+            join pg_class c on c.oid = t.attrelid
+            join pg_namespace n on n.oid = c.relnamespace
+            cross join lateral aclexplode(t.attacl) a
+            join roles r on r.oid = a.grantee
+            where n.nspname in ('public', 'etudes') and t.attacl is not null and not t.attisdropped
+          ),
+          fn as (
+            select n.nspname, p.proname, pg_get_function_identity_arguments(p.oid) as args, r.nm
+            from pg_proc p
+            join pg_namespace n on n.oid = p.pronamespace
+            cross join lateral aclexplode(coalesce(p.proacl, acldefault('f'::"char", p.proowner))) a
+            join roles r on r.oid = a.grantee
+            where n.nspname in ('public', 'etudes') and a.privilege_type = 'EXECUTE'
+          )
+          select format('grant %s on %s %I.%I to %s;', privs,
+                        case when relkind = 'S' then 'sequence' else 'table' end, nspname, relname, nm) from rel
+          union all
+          select format('grant %s (%I) on table %I.%I to %s;', privilege_type, attname, nspname, relname, nm) from col
+          union all
+          select format('grant execute on routine %I.%I(%s) to %s;', nspname, proname, args, nm) from fn
+          order by 1;
+          SQL
+
+      - name: Lire les droits de la prod
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          psql "$SUPABASE_DB_URL" -X -A -t -f droits.sql > prod.txt
+          echo "Droits en prod : $(wc -l < prod.txt) lignes"
+
+      - name: Aligner la preprod
+        run: |
+          set -euo pipefail
+          {
+            echo "revoke all on all tables in schema public, etudes from anon, authenticated, public;"
+            echo "revoke all on all sequences in schema public, etudes from anon, authenticated, public;"
+            echo "revoke all on all routines in schema public, etudes from anon, authenticated, public;"
+            cat prod.txt
+          } > alignement.sql
+          psql "$PREPROD_DB_URL" -X -q -1 -v ON_ERROR_STOP=1 -f alignement.sql > /dev/null 2> erreurs.txt \
+            || { echo "::error::Alignement annule (transaction unique, rien n'a change)"; grep -o 'ERROR:.*' erreurs.txt | cut -c1-200 | head -20; exit 1; }
+          echo "Alignement applique."
+
+      - name: Verifier que les droits sont identiques
+        run: |
+          set -euo pipefail
+          psql "$PREPROD_DB_URL" -X -A -t -f droits.sql > preprod.txt
+          echo "Droits en preprod : $(wc -l < preprod.txt) lignes"
+          if diff -q prod.txt preprod.txt > /dev/null; then
+            echo "Droits identiques entre prod et preprod."
+          else
+            echo "::error::Ecart de droits : $(diff prod.txt preprod.txt | grep -c '^[<>]') ligne(s) differente(s)"
+            exit 1
+          fi
