@@ -24,17 +24,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Garde-fous sur les cibles
-        env:
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-          PREPROD_DB_URL: ${{ secrets.PREPROD_DB_URL }}
-        run: |
-          set -euo pipefail
-          case "$SUPABASE_DB_URL" in *"$PROD_REF"*) ;; *) echo "::error::SUPABASE_DB_URL ne vise pas la prod attendue"; exit 1 ;; esac
-          case "$PREPROD_DB_URL" in *"$PREPROD_REF"*) ;; *) echo "::error::PREPROD_DB_URL ne vise pas la preprod"; exit 1 ;; esac
-          case "$PREPROD_DB_URL" in *"$PROD_REF"*) echo "::error::PREPROD_DB_URL contient la reference de la PROD, abandon"; exit 1 ;; esac
-          echo "Source : prod ($PROD_REF), lecture seule. Cible : preprod ($PREPROD_REF)."
-
       - name: Installer le client PostgreSQL 17
         run: |
           set -euo pipefail
@@ -44,9 +33,38 @@ jobs:
           sudo apt-get install -y -qq postgresql-client-17
           echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
 
-      - name: Verifier que la preprod est vide
+      # Le secret PREPROD_DB_URL peut contenir l'adresse complete ou seulement le mot de passe :
+      # dans ce cas l'adresse du pooler de session (port 5432) est reconstruite ici.
+      - name: Preparer l'adresse de la preprod
         env:
-          PREPROD_DB_URL: ${{ secrets.PREPROD_DB_URL }}
+          PREPROD_SECRET: ${{ secrets.PREPROD_DB_URL }}
+        run: |
+          set -euo pipefail
+          case "$PREPROD_SECRET" in
+            postgres://*|postgresql://*) url="$PREPROD_SECRET" ;;
+            *)
+              url=""
+              for h in aws-0-eu-west-1 aws-1-eu-west-1; do
+                c="postgresql://postgres.${PREPROD_REF}:${PREPROD_SECRET}@${h}.pooler.supabase.com:5432/postgres"
+                if psql "$c" -X -A -t -c "select 1" > /dev/null 2>&1; then url="$c"; echo "Pooler trouve : $h"; break; fi
+              done
+              if [ -z "$url" ]; then echo "::error::Connexion a la preprod impossible avec ce mot de passe"; exit 1; fi
+              ;;
+          esac
+          echo "::add-mask::$url"
+          echo "PREPROD_DB_URL=$url" >> "$GITHUB_ENV"
+
+      - name: Garde-fous sur les cibles
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          case "$SUPABASE_DB_URL" in *"$PROD_REF"*) ;; *) echo "::error::SUPABASE_DB_URL ne vise pas la prod attendue"; exit 1 ;; esac
+          case "$PREPROD_DB_URL" in *"$PREPROD_REF"*) ;; *) echo "::error::PREPROD_DB_URL ne vise pas la preprod"; exit 1 ;; esac
+          case "$PREPROD_DB_URL" in *"$PROD_REF"*) echo "::error::PREPROD_DB_URL contient la reference de la PROD, abandon"; exit 1 ;; esac
+          echo "Source : prod ($PROD_REF), lecture seule. Cible : preprod ($PREPROD_REF)."
+
+      - name: Verifier que la preprod est vide
         run: |
           set -euo pipefail
           n="$(psql "$PREPROD_DB_URL" -X -A -t -c "select count(*) from pg_tables where schemaname in ('public','etudes')")"
@@ -65,8 +83,6 @@ jobs:
           echo "structure.sql : $(wc -l < structure.sql) lignes ; migrations.sql : $(wc -l < migrations.sql) lignes"
 
       - name: Ecrire la structure dans la preprod
-        env:
-          PREPROD_DB_URL: ${{ secrets.PREPROD_DB_URL }}
         run: |
           set -uo pipefail
           psql "$PREPROD_DB_URL" -X -q -v ON_ERROR_STOP=0 -f structure.sql > /dev/null 2> erreurs-structure.txt
@@ -79,7 +95,6 @@ jobs:
       - name: Comparer prod et preprod
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-          PREPROD_DB_URL: ${{ secrets.PREPROD_DB_URL }}
         run: |
           set -euo pipefail
           q="select 'tables', count(*) from pg_tables where schemaname in ('public','etudes')
