@@ -1,0 +1,117 @@
+name: Fond de carte de la France (Irva)
+
+# Fond de carte facon Google Maps des pages Presence locale d'Irva : rues, quartiers,
+# commerces (donnees OpenStreetMap, carte de base Protomaps). Extrait la France
+# (metropole, Corse et DOM) de la carte mondiale publiee par Protomaps, sans la
+# telecharger en entier, puis l'envoie dans le bucket R2 irva-cartes avec les polices
+# et les icones de la carte. Aucun secret : chaque envoi porte le jeton OIDC signe par
+# GitHub pour cette action, verifie par le Worker d'import.
+# Lance a la main (Actions > Fond de carte > Run workflow), au besoin une fois par an.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: "Carte mondiale Protomaps (AAAAMMJJ, vide = la plus recente)"
+        required: false
+        default: ""
+      maxzoom:
+        description: "Zoom maximal des tuiles"
+        required: false
+        default: "15"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: cartes
+  cancel-in-progress: false
+
+env:
+  PMTILES_VERSION: "1.31.2"
+  IMPORT_URL: "https://irva-cartes-import.girodg-pro.workers.dev"
+
+jobs:
+  cartes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Outil pmtiles (Protomaps)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o pmtiles.tar.gz "https://github.com/protomaps/go-pmtiles/releases/download/v${PMTILES_VERSION}/go-pmtiles_${PMTILES_VERSION}_Linux_x86_64.tar.gz"
+          tar -xzf pmtiles.tar.gz pmtiles
+          ./pmtiles version
+
+      - name: Extraction de la France
+        run: |
+          set -euo pipefail
+          build="${{ github.event.inputs.build }}"
+          if [ -z "$build" ]; then
+            build=$(curl -fsSL https://build-metadata.protomaps.dev/builds.json | jq -r '.[-1].key' | sed 's/\.pmtiles$//')
+          fi
+          echo "Carte mondiale : $build"
+          # Metropole et Corse, Guadeloupe, Martinique, Guyane, La Reunion, Mayotte.
+          cat > france.geojson <<'EOF'
+          {"type":"Feature","properties":{},"geometry":{"type":"MultiPolygon","coordinates":[
+            [[[-5.3,41.3],[9.7,41.3],[9.7,51.2],[-5.3,51.2],[-5.3,41.3]]],
+            [[[-61.9,15.8],[-60.9,15.8],[-60.9,16.6],[-61.9,16.6],[-61.9,15.8]]],
+            [[[-61.3,14.35],[-60.75,14.35],[-60.75,14.9],[-61.3,14.9],[-61.3,14.35]]],
+            [[[-54.7,2.1],[-51.5,2.1],[-51.5,5.85],[-54.7,5.85],[-54.7,2.1]]],
+            [[[55.2,-21.4],[55.85,-21.4],[55.85,-20.85],[55.2,-20.85],[55.2,-21.4]]],
+            [[[44.95,-13.05],[45.35,-13.05],[45.35,-12.6],[44.95,-12.6],[44.95,-13.05]]]
+          ]}}
+          EOF
+          ./pmtiles extract "https://build.protomaps.com/${build}.pmtiles" france.pmtiles \
+            --region=france.geojson --maxzoom="${{ github.event.inputs.maxzoom }}" --download-threads=8
+          ./pmtiles show france.pmtiles | head -30
+          ls -l france.pmtiles
+          echo "BUILD=$build" >> "$GITHUB_ENV"
+
+      - name: Envoi de la carte dans R2 (irva-cartes/france.pmtiles)
+        run: |
+          set -euo pipefail
+          token() { curl -fsSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=irva-cartes-import" | jq -r .value; }
+          key="france.pmtiles"
+          # Morceaux de 95 Mo (limite d'une requete au Worker : 100 Mo), tous de meme taille sauf le dernier.
+          split -b 95M -d -a 4 france.pmtiles part_
+          upload=$(curl -fsS -X POST -H "Authorization: Bearer $(token)" "$IMPORT_URL/mpu/create?key=$key&type=application/vnd.pmtiles" | jq -r .uploadId)
+          n=0
+          echo "[]" > parts.json
+          for f in part_*; do
+            n=$((n + 1))
+            for attempt in 1 2 3; do
+              if part=$(curl -fsS -X PUT -H "Authorization: Bearer $(token)" --data-binary "@$f" "$IMPORT_URL/mpu/part?key=$key&uploadId=$upload&n=$n"); then break; fi
+              echo "Nouvel essai du morceau $n"; sleep 10
+            done
+            jq --argjson p "$part" '. + [$p]' parts.json > parts.tmp && mv parts.tmp parts.json
+            echo "Morceau $n envoye"
+          done
+          curl -fsS -X POST -H "Authorization: Bearer $(token)" -H "Content-Type: application/json" --data @parts.json "$IMPORT_URL/mpu/complete?key=$key&uploadId=$upload"
+          echo
+          echo "Taille locale : $(stat -c %s france.pmtiles)"
+          curl -fsS -H "Authorization: Bearer $(token)" "$IMPORT_URL/head?key=$key"
+
+      - name: Polices et icones de la carte
+        run: |
+          set -euo pipefail
+          token() { curl -fsSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=irva-cartes-import" | jq -r .value; }
+          git clone --depth 1 https://github.com/protomaps/basemaps-assets.git assets
+          tok=$(token); since=$(date +%s); count=0
+          put() {
+            # Jeton renouvele toutes les 2 minutes.
+            if [ $(( $(date +%s) - since )) -gt 120 ]; then tok=$(token); since=$(date +%s); fi
+            enc=$(jq -rn --arg k "$1" '$k|@uri')
+            curl -fsS --retry 3 -X PUT -H "Authorization: Bearer $tok" --data-binary "@$2" "$IMPORT_URL/put?key=$enc&type=$3" > /dev/null
+            count=$((count + 1))
+          }
+          for font in "Noto Sans Regular" "Noto Sans Medium" "Noto Sans Italic"; do
+            for f in "assets/fonts/$font"/*.pbf; do put "fonts/$font/$(basename "$f")" "$f" "application/x-protobuf"; done
+          done
+          for f in assets/sprites/v4/light*; do
+            case "$f" in *.json) type=application/json ;; *.png) type=image/png ;; *) continue ;; esac
+            put "sprites/v4/$(basename "$f")" "$f" "$type"
+          done
+          echo "$count fichiers envoyes (polices et icones)"
+          echo "Carte mondiale utilisee : $BUILD"
