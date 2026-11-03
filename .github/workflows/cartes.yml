@@ -111,8 +111,7 @@ jobs:
             # Jeton renouvele toutes les 2 minutes.
             if [ $(( $(date +%s) - since )) -gt 120 ]; then tok=$(token); since=$(date +%s); fi
             enc=$(jq -rn --arg k "$1" '$k|@uri')
-            if ! out=$(curl -sS --retry 3 -w "
-%{http_code}" -X PUT -H "Authorization: Bearer $tok" --data-binary "@$2" "$IMPORT_URL/put?key=$enc&type=$3"); then echo "Echec reseau : $1"; exit 1; fi
+            if ! out=$(curl -sS --retry 3 -w "\n%{http_code}" -X PUT -H "Authorization: Bearer $tok" --data-binary "@$2" "$IMPORT_URL/put?key=$enc&type=$3"); then echo "Echec reseau : $1"; exit 1; fi
             if [ "$(echo "$out" | tail -1)" != "200" ]; then echo "Refuse : $1 : $out"; exit 1; fi
             count=$((count + 1))
           }
