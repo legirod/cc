@@ -74,11 +74,22 @@ jobs:
         run: |
           set -euo pipefail
           TODAY="$(date -u +%F)"
+          # Depot public : aucun nom de fichier client dans le journal. Le detail
+          # de rclone va dans un fichier du runner (jamais publie), seuls des
+          # compteurs sont affiches.
+          LOG="$RUNNER_TEMP/rclone-storage.log"
+          STATUS=0
           rclone sync supabase: "r2:${{ secrets.R2_BUCKET }}/storage/current/" \
             --backup-dir "r2:${{ secrets.R2_BUCKET }}/storage/supprimes/${TODAY}/" \
-            --fast-list --transfers 8 --checkers 16 --retries 3 --progress
+            --fast-list --transfers 8 --checkers 16 --retries 3 \
+            --stats 0 --log-level INFO --log-file "$LOG" || STATUS=$?
+          echo "Fichiers copies                : $(grep -c ': Copied' "$LOG" || true)"
+          echo "Fichiers mis de cote (supprimes) : $(grep -c ': Moved' "$LOG" || true)"
+          echo "Erreurs                        : $(grep -c 'ERROR' "$LOG" || true)"
           echo "=== Contenu sauvegarde dans R2 (storage/current/) ==="
           rclone lsd "r2:${{ secrets.R2_BUCKET }}/storage/current/" || true
+          echo "Total : $(rclone size "r2:${{ secrets.R2_BUCKET }}/storage/current/" --fast-list --json)"
+          exit $STATUS
 
       - name: Retention (fichiers supprimes depuis plus de RETENTION_DAYS jours)
         run: |

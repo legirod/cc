@@ -93,9 +93,9 @@ jobs:
       - name: Envoi vers R2
         run: |
           set -euo pipefail
-          rclone copy "$FILE" "r2:${{ secrets.R2_BUCKET }}/db/" --progress
-          echo "Backups presents sur R2 :"
-          rclone lsl "r2:${{ secrets.R2_BUCKET }}/db/"
+          # Depot public : journal reduit a des compteurs.
+          rclone copy "$FILE" "r2:${{ secrets.R2_BUCKET }}/db/" -q
+          echo "Backups presents sur R2 : $(rclone size "r2:${{ secrets.R2_BUCKET }}/db/" --json)"
 
       - name: Retention (purge des backups > RETENTION_DAYS jours)
         run: |
